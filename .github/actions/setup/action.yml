@@ -1,0 +1,7 @@
+name: Zig toolchain
+description: Install the checksum-pinned Zig 0.17.0 compiler
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: scripts/setup-zig.sh

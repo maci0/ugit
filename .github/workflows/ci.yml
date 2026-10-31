@@ -1,0 +1,157 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
+      - run: shellcheck scripts/setup-zig.sh
+      - run: zig fmt --check build.zig build.zig.zon tests.zig src
+      - run: python3 -m unittest discover -s tests/release -v
+      - name: Checkout pinned MISRA-Zig checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maci0/misra-zig
+          ref: 0f1747715d55ba9fbeb5d40e622f6fd9fd521e96
+          path: .scratch/misra-zig
+          persist-credentials: false
+      - name: MISRA-Zig reachability and source checks
+        run: zig run -ODebug .scratch/misra-zig/tools/misra_lint.zig -- --root tests.zig build.zig tests.zig src/*.zig
+      - name: Validate release tag and notes
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/release.py check-tag "$TAG"
+
+  tests:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [Debug, ReleaseSafe, ReleaseSmall]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Unit tests and Git conformance
+        env:
+          MODE: ${{ matrix.mode }}
+        run: |
+          zig test tests.zig -target x86_64-linux-musl -O"$MODE"
+          zig build -Doptimize="$MODE" -j2
+          python3 tests/conformance.py
+
+  build:
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [x86_64, armv7]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - name: Build, validate ELF and package
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: python3 scripts/release.py build "$PROFILE" --output .scratch/assets
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.profile }}
+          path: .scratch/assets/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  package:
+    needs: [tests, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: .scratch/bundle
+          merge-multiple: true
+      - name: Verify complete bundle and test the packaged native binary
+        run: |
+          python3 scripts/release.py verify .scratch/bundle
+          python3 scripts/release.py extract-native .scratch/bundle --output .scratch/smoke/bin/ugit
+          python3 tests/conformance.py --binary .scratch/smoke/bin/ugit
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-bundle
+          path: .scratch/bundle/*
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-bundle
+          path: .scratch/bundle
+      - name: Create draft, verify downloaded assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          existing=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)
+          if [[ $existing == true ]]; then
+            gh release upload "$TAG" --clobber .scratch/bundle/*.tar.gz .scratch/bundle/*.sha256 .scratch/bundle/SHA256SUMS
+            gh release edit "$TAG" --notes-file "docs/releases/$TAG.md"
+          elif [[ $existing != false ]]; then
+            gh release create "$TAG" --verify-tag --draft --title "ugit $TAG" --notes-file "docs/releases/$TAG.md" .scratch/bundle/*.tar.gz .scratch/bundle/*.sha256 .scratch/bundle/SHA256SUMS
+          fi
+          gh release download "$TAG" --dir .scratch/published
+          python3 scripts/release.py verify .scratch/published
+          cmp .scratch/bundle/SHA256SUMS .scratch/published/SHA256SUMS
+          if [[ $existing != false ]]; then
+            gh release edit "$TAG" --draft=false --latest
+          fi
