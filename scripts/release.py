@@ -67,7 +67,14 @@ def source_commit():
     return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
 
 
+def require_clean_source():
+    status = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'], cwd=ROOT)
+    if status:
+        raise ValueError('release builds require a clean source checkout')
+
+
 def build(profile, output):
+    require_clean_source()
     if subprocess.check_output(['zig', 'version'], text=True).strip() != '0.17.0':
         raise ValueError('release builds require Zig 0.17.0')
     output.mkdir(parents=True, exist_ok=True)

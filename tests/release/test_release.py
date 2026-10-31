@@ -149,6 +149,14 @@ class ReleaseTests(unittest.TestCase):
         self.git('commit', '-m', 'fixture')
         self.git('update-ref', 'refs/remotes/origin/main', 'HEAD')
 
+    def test_dirty_source_rejected(self):
+        self.tag_repository()
+        with patch.object(release, 'ROOT', self.directory):
+            release.require_clean_source()
+            (self.directory / 'uncommitted.zig').write_text('not the recorded source\n')
+            with self.assertRaisesRegex(ValueError, 'clean source checkout'):
+                release.require_clean_source()
+
     def test_annotated_matching_tag(self):
         self.tag_repository()
         self.git('tag', '-a', 'v0.1.0', '-m', 'release')
